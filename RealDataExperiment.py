@@ -22,8 +22,14 @@ from sklearn.mixture import GaussianMixture
 from skfuzzy.cluster import cmeans
 from skfuzzy.cluster import cmeans_predict
 
+# Logistic Regression
+from sklearn.linear_model import LinearRegression, LogisticRegressionCV
+from sklearn.model_selection import StratifiedShuffleSplit
+from sklearn.metrics import roc_auc_score
+
 # Plotting
 import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
 
 # Stats
 from scipy.stats import ttest_1samp
@@ -71,16 +77,25 @@ def ag_predict(model,X1,X2): # X1 is original data used for clustering, X2 is ne
 
 #%% My G2PC Feature Importance Function - This function calculates the percent change in the clustering after permutation
 
-def G2PC(mdl,X,Y,K,groups,random_state): # K = number of repeats
-    Pct_Chg = np.zeros((K,len(np.unique(groups)))) # preallocate output matrix K x number of groups
-            
-    for j in np.unique(groups): # for j feature groups
+# add functionality that transposes X if the 0 dimension isn't the same length as Y
+
+def G2PC(mdl,X,Y,n_repeats,groups,random_state,check_var):
+    Pct_Chg = np.zeros((n_repeats,len(np.unique(groups)))) # preallocate output matrix number of repeats x number of features
+    if check_var == 1:
+        R = np.zeros((np.shape(X)[0],len(np.unique(groups)))) # preallocate matrix of ratio of cluster label changes to number of repeats
+        VarData = np.zeros_like(R) # preallocate matrix of variance of permuted values for each sample and group
+        MeanData = np.zeros_like(R)
         
-        for k in range(K): # for k in K repeats
+    for j in np.unique(groups): # for j feature groups
+        if check_var == 1:
+            Record = np.zeros((np.shape(X)[0],np.sum(list(groups == j*np.ones_like(groups))),n_repeats)) # N Samples x N Features per Group x N Repeats
+        for k in range(n_repeats): # for k repeats
             np.random.seed(seed=k)
             X_2 = np.copy(X); X_2[:] = X[:]; # duplicate data array
             Sub_Data = np.random.permutation(X_2[:,np.squeeze(list(groups == j*np.ones_like(groups)))]) # shuffle feature
             X_2[:,np.squeeze(list(groups == j*np.ones_like(groups)))] = Sub_Data # add shuffled data to data matrix
+            if check_var == 1:
+                Record[:,:,k] = Sub_Data # keep track of values for each permuted feature
             
             if type(mdl).__name__ == "DBSCAN": # For DBScan
                 Y_2 = dbscan_predict(mdl,X_2) 
@@ -97,8 +112,16 @@ def G2PC(mdl,X,Y,K,groups,random_state): # K = number of repeats
                 print('This Model-type is not supported.')
             # print(np.sum(np.array(Y)!=np.array(Y_2))/len(np.squeeze(Y)))
             Pct_Chg[k,j] = np.sum(np.array(Y)!=np.array(Y_2))/len(np.squeeze(Y)) # calculate percent change
+            if check_var == 1:
+                R[:,j] += np.squeeze(np.array(Y)!=np.array(Y_2))/n_repeats
+                VarData[:,j] = np.mean(np.var(Record,axis= 2),axis=1)
+                MeanData[:,j] = np.mean(np.mean(Record,axis= 2),axis=1)
 
-    return(Pct_Chg)
+                
+    if check_var == 1:
+        return(Pct_Chg,R,VarData,MeanData)
+    else:
+        return(Pct_Chg)
 
 #%% My L2PC Feature Importance Function - This function calculates the percent change in the clustering of a sample after repeated Perturbation
 
@@ -144,6 +167,70 @@ def L2PC(mdl,X,Y,M, n_repeats,groups,random_state): # M = number of samples per 
 
     return(Pct_Chg)
 
+#%% Performance Assessment Function
+def Performance_Assessment(y_test,y_pred,threshold_opt):
+    # Given the positive column of the test labels and predicted scores, 
+    # this function computes an interpolated ROC curve (for exactly 100 FPR points between 0 and 1), 
+    # the AUC, the Sensitivity, the Specificity, and the Accuracy of a classifier.
+    
+    AUC = (roc_auc_score(y_test,y_pred,average='weighted'))
+    
+    y_pred[y_pred>=threshold_opt] = 1
+    y_pred[y_pred<threshold_opt] = 0
+    ConfMat = np.zeros((2,2))
+    for i in np.arange(len(y_test)):
+        ConfMat[int(y_pred[i]),int(y_test[i])] += 1
+    SPEC = ((ConfMat[0,0]/(ConfMat[0,0] + ConfMat[1,0])))
+    SENS = ((ConfMat[1,1]/(ConfMat[1,1] + ConfMat[0,1])))
+    return(AUC,SPEC,SENS)
+
+#%% LR-ENR
+
+def LR_ENR(X_z,Y_pred,groups,GroupNames):
+    cv_method = StratifiedShuffleSplit(n_splits=10,train_size=0.8,test_size=0.2,random_state=0)
+    cv_method2 = StratifiedShuffleSplit(n_splits=10,train_size=0.8,test_size=0.2,random_state=0)
+    
+    
+    group_effect_vals = []; label_act = [];
+    AUC = []; SPEC = []; SENS = [];
+    
+    step = 0
+    for train_index, test_index in cv_method.split(X_z,Y_pred):
+        # Select data
+        x_train = X_z[train_index,:]; y_train = np.squeeze(Y_pred[train_index])
+        x_test = X_z[test_index,:]; y_test = np.squeeze(Y_pred[test_index])
+        label_act.append(y_test)
+        
+        # Define parameter values to be considered in analysis.
+        l1_ratios = [0.25, 0.5, 0.75, 0.85, 0.9, 0.95, 0.99]; #np.linspace(0,1.0,25)
+        Cs = np.geomspace(10**-4,10**4,num=100)
+        
+        # Train LR-ENR classifier
+        clf = LogisticRegressionCV(penalty='elasticnet',solver='saga',l1_ratios=list(l1_ratios),Cs = Cs,cv=cv_method2,max_iter=200000,random_state=step,n_jobs=8).fit(x_train,y_train)
+        
+        # Output permutation feature importance
+        effect = x_train*clf.coef_ # effect of each feature (coefficent * feature value)
+        
+        mean_effect = np.mean(np.absolute(effect),axis=0) # mean effect of each feature across all test samples
+        
+        group_effect = np.zeros((1,len(GroupNames))) # mean of mean effect for each group of features
+        for i in np.unique(groups):
+            group_effect[:,i-1] = np.mean(mean_effect[np.squeeze(groups==i*np.ones_like(groups))])
+        
+        group_effect_vals.append(group_effect);
+        predicted_labels = clf.predict_proba(x_test)[:,1]
+        
+        # Compute Classification Performance
+        [auc,spec,sens] = Performance_Assessment(y_test, predicted_labels, 0.5)
+        
+        AUC.append(auc); SPEC.append(spec); SENS.append(sens);
+        
+    group_effect_vals2 = np.zeros((np.shape(group_effect_vals)[0],np.shape(group_effect_vals[0])[1]))
+    for i in range(np.shape(group_effect_vals)[0]):
+        group_effect_vals2[i,:] = np.squeeze(group_effect_vals[i])
+        
+    return(group_effect_vals2,AUC)
+
 #%% Choose Dataset to Analyze
 
 SZ_Only = 0 
@@ -154,11 +241,11 @@ SZ_Only = 0
 #%% Load and Format Data
 
 
-file_loc = "C:/Users/antho/OneDrive/Documents/Calhoun_Lab/Projects/Clustering_Explainability/DataAndResults/FBIRN_formatted.mat"
+file_loc = "C:/Users/antho/OneDrive/Documents/Calhoun_Lab/Projects/Clustering_Explainability/JMLR/KDD2021/DataAndResults/FBIRN_formatted.mat"
 X = loadmat(file_loc, appendmat=True)['sFNC']
-groups = loadmat(file_loc, appendmat=True)['groups']
+groups = loadmat(file_loc, appendmat=True)['groups2']
 Y_real = loadmat(file_loc,appendmat=True)['analysis_SCORE'][:,2]-1
-GroupNames = loadmat(file_loc, appendmat=True)['GroupNames']
+GroupNames = loadmat(file_loc, appendmat=True)['GroupNames2']
 
 # Select Samples
 if SZ_Only == 1:
@@ -171,10 +258,9 @@ if SZ_Only == 1:
 X_z = X
 
 #%% K-Means Clustering
-
-# Optimize Number of Clusters with Silhouette Method
-n_clusters = np.arange(2,16)  # number of clusters to try
-silhouette_vals = np.zeros((len(n_clusters),1)) # preallocate array for silhouette values
+  
+n_clusters = np.arange(2,16)  
+silhouette_vals = np.zeros((len(n_clusters),1))
 
 count = 0
 for i in n_clusters:
@@ -186,22 +272,22 @@ for i in n_clusters:
     
     count += 1
     
-# Plot Silhouette Values
+
 fig = plt.figure(figsize=(5,5))
 plt.plot(n_clusters,silhouette_vals)
 
-# Find Optimal Silhouette Value, its Index, and its corresponding number of clusters
 max_idx = np.argmax(silhouette_vals)
 opt_cluster = n_clusters[max_idx]
 
-# Redo the clustering with the optimal number of clusters
 kcluster = KMeans(n_clusters=opt_cluster,n_init = 100, random_state=0).fit(X_z)
 Y_pred_kmeans = np.transpose(kcluster.labels_)
 
 # G2PC
-permut_kmeans_G2PC = G2PC(kcluster,X_z,Y_pred_kmeans,100, np.squeeze(groups-1),1)
 
-# Plot G2PC Results
+# permut_kmeans_G2PC,R,VarData,MeanData = G2PC(kcluster,X_z,Y_pred_kmeans,100, np.squeeze(groups-1),1,1)
+permut_kmeans_G2PC = G2PC(kcluster,X_z,Y_pred_kmeans,100, np.squeeze(groups-1),1,0)
+
+
 fig = plt.figure(figsize=(10,10))
 ax = plt.boxplot((permut_kmeans_G2PC))
 plt.xticks(np.arange(1,len(GroupNames)+1),GroupNames,rotation=90,fontsize=14)#
@@ -209,9 +295,9 @@ ylabel = plt.ylabel('Permutation Percent Change',fontsize=16)
 title = plt.title('G2PC - K-Means Results',fontsize=20)
 
 # L2PC
+
 permut_kmeans_L2PC = L2PC(kcluster, X_z, Y_pred_kmeans, 30, 100,np.squeeze(groups-1), 0)
 
-# Plot L2PC Results
 fig = plt.figure(figsize=(10,10))
 for i in range(np.shape(permut_kmeans_L2PC)[0]):
     if Y_pred_kmeans[i] == 0:
@@ -225,20 +311,25 @@ for i in range(np.shape(permut_kmeans_L2PC)[0]):
     elif Y_pred_kmeans[i] == 4:
         c = 'yellow'
     plt.plot(np.mean(permut_kmeans_L2PC[i,:,:],axis=0),marker='o',color=c,alpha=0.3)
+# plt.plot(np.mean(permut_kmeans_L2PC,axis=(0,1)),marker='o',color='black',linewidth=2,markersize=12)
 plt.plot(np.mean(np.mean(permut_kmeans_L2PC,axis=(1)),axis=0),marker='o',color='black',linewidth=2,markersize=12)
 x_tick_pts = np.arange(28)
 plt.xticks(x_tick_pts, GroupNames,rotation=90,fontsize=14)
 plt.title('L2PC - K-Means Results',fontsize=20)
 ylabel = plt.ylabel('Perturbation Percent Change',fontsize=16)
 
-ACC_kmeans = np.sum(np.array(np.squeeze(Y_real))!=np.array(Y_pred_kmeans))/len(Y_pred_kmeans) # Calculate accuracy of clustering, note that if cluster labels don't align correctly, accuracy may be below 50%
+ACC_kmeans = np.sum(np.array(np.squeeze(Y_real))!=np.array(Y_pred_kmeans))/len(Y_pred_kmeans)
+
+# Logistic Regression
+
+Mean_Effect_Kmeans,AUC_Kmeans = LR_ENR(X_z,Y_pred_kmeans,groups,GroupNames)
 
 #%% DBScan
 
 np.random.seed(seed=i)
 
-# Determine Optimal Epsilon Parameter Value with Silhouette Method
-ep_vals = np.arange(0.5,20,0.5) # epsilon values to try
+# Determine Optimal Epsilon Parameter Value
+ep_vals = np.arange(0.5,20,0.5)
 silhouette_vals = np.zeros((len(ep_vals),1)) # set default value of 0 for silhouette
 count = 0
 for ep in ep_vals:
@@ -254,9 +345,8 @@ clustering = DBSCAN(eps=best_ep,min_samples=3).fit(X_z) # train DBScan clusterin
 Y_pred_dbscan = np.transpose(clustering.labels_) # obtain predicted labels
 
 # G2PC
-permut_dbscan_G2PC = G2PC(clustering,X_z,Y_pred_dbscan,100, np.squeeze(groups-1),1)
-
-# Plot G2PC Results
+permut_dbscan_G2PC = G2PC(clustering,X_z,Y_pred_dbscan,100, np.squeeze(groups-1),1,0)
+        
 fig = plt.figure(figsize=(5,5))
 ax = plt.boxplot((permut_dbscan_G2PC))
 plt.xticks(np.arange(1,len(GroupNames)+1),GroupNames,rotation=90,fontsize=14)#
@@ -266,7 +356,6 @@ title = plt.title('G2PC - DBScan Results',fontsize=20)
 # L2PC
 permut_dbscan_L2PC = L2PC(clustering,  X_z, Y_pred_dbscan, 30, 100,np.squeeze(groups-1), 0)
 
-# Plot L2PC Results
 fig = plt.figure(figsize=(10,10))
 for i in range(np.shape(permut_dbscan_L2PC)[0]):
     if Y_pred_dbscan[i] == 0:
@@ -280,21 +369,21 @@ for i in range(np.shape(permut_dbscan_L2PC)[0]):
     elif Y_pred_dbscan[i] == 4:
         c = 'yellow'
     plt.plot(np.mean(permut_dbscan_L2PC[i,:,:],axis=0),marker='o',color=c,alpha=0.3)
+# plt.plot(np.median(permut_dbscan_L2PC,axis=(0,1)),marker='o',color='black',linewidth=2,markersize=12)
 plt.plot(np.mean(np.mean(permut_dbscan_L2PC,axis=(1)),axis=0),marker='o',color='black',linewidth=2,markersize=12)
 x_tick_pts = np.arange(1,29)
 plt.xticks(x_tick_pts, GroupNames,rotation=90,fontsize=14)
 plt.title('L2PC - DBScan Results',fontsize=20)
 ylabel = plt.ylabel('Perturbation Percent Change',fontsize=16)
 
-ACC_dbscan = np.sum(np.array(np.squeeze(Y_real))==np.array(Y_pred_dbscan))/len(Y_pred_dbscan) # Calculate accuracy of clustering, note that if cluster labels don't align correctly, accuracy may be below 50%
-
+ACC_dbscan = np.sum(np.array(np.squeeze(Y_real))==np.array(Y_pred_dbscan))/len(Y_pred_dbscan)
 
 #%% GMM
 
 
 # Determine Optimal Number of Clusters
-n_clusters = np.arange(2,16)  # number of clustes to try
-silhouette_vals = np.zeros((len(n_clusters),1)) # preallocate array for silhouette values
+n_clusters = np.arange(2,16)  
+silhouette_vals = np.zeros((len(n_clusters),1))
 
 count = 0
 for i in n_clusters:
@@ -306,26 +395,21 @@ for i in n_clusters:
     
     count += 1
     
-# Plot the Silhouette Values
+
 fig = plt.figure(figsize=(5,5))
 plt.plot(n_clusters,silhouette_vals)
 
-max_idx = np.argmax(silhouette_vals) # Calculate Index of Max Silhouette Value
-opt_cluster = n_clusters[max_idx] # Find Optimal Number of Clusters Using Index
+max_idx = np.argmax(silhouette_vals)
+opt_cluster = n_clusters[max_idx]
 
-# Retrain the GMM with Optimal Number of Clusters
 gmm = GaussianMixture(n_components=opt_cluster, max_iter = 500, random_state=0).fit(X_z)
 
-# Obtain Predicted Labels
 Y_pred_gmm = np.transpose(gmm.predict(X_z))
 
-# G2PC
-permut_gmm_G2PC = G2PC(gmm,X_z,Y_pred_gmm,100, np.squeeze(groups-1),0)
+permut_gmm_G2PC = G2PC(gmm,X_z,Y_pred_gmm,100, np.squeeze(groups-1),1,0)
 
-# Calculate Accuracy of GMM (note that accuracy may be below 50% if cluster labels don't match real class labels)
 ACC_gmm = np.sum(np.array(np.squeeze(Y_real))==np.array(Y_pred_gmm))/len(Y_pred_gmm)
 
-# Plot G2PC Results
 fig = plt.figure(figsize=(10,10))
 ax = plt.boxplot((permut_gmm_G2PC))
 plt.xticks(np.arange(1,len(GroupNames)+1),GroupNames,rotation=90,fontsize=14)#
@@ -348,6 +432,7 @@ for i in range(np.shape(permut_gmm_L2PC)[0]):
     elif Y_pred_gmm[i] == 4:
         c = 'yellow'
     plt.plot(np.mean(permut_gmm_L2PC[i,:,:],axis=0),marker='o',color=c,alpha=0.3)
+# plt.plot(np.median(permut_dbscan_L2PC,axis=(0,1)),marker='o',color='black',linewidth=2,markersize=12)
 plt.plot(np.mean(np.mean(permut_gmm_L2PC,axis=(1)),axis=0),marker='o',color='black',linewidth=2,markersize=12)
 x_tick_pts = np.arange(1,29)
 plt.xticks(x_tick_pts, GroupNames,rotation=90,fontsize=14)
@@ -357,8 +442,8 @@ ylabel = plt.ylabel('Perturbation Percent Change',fontsize=16)
 #%% Agglomerative Clustering
 
 # Determine Optimal Number of Clusters
-n_clusters = np.arange(2,16) # number of clusters to try
-silhouette_vals = np.zeros((len(n_clusters),1)) # preallocate array for silhouette values
+n_clusters = np.arange(2,16)  
+silhouette_vals = np.zeros((len(n_clusters),1))
 
 count = 0
 for i in n_clusters:
@@ -371,25 +456,21 @@ for i in n_clusters:
     
     count += 1
     
-# Plot Silhouette Values
+
 fig = plt.figure(figsize=(5,5))
 plt.plot(n_clusters,silhouette_vals)
 
-max_idx = np.argmax(silhouette_vals) # Find Index of Max Silhouette Value
-opt_cluster = n_clusters[max_idx] # Find Optimal Number of Clusters with Index
+max_idx = np.argmax(silhouette_vals)
+opt_cluster = n_clusters[max_idx]
 
-# Redo Clustering with Optimal Number of Clusters
 ag = AgglomerativeClustering(n_clusters=opt_cluster).fit(X_z)
 
-Y_pred_ag = np.transpose(ag.labels_) # Obtain Cluster Labels
+Y_pred_ag = np.transpose(ag.labels_)
 
-# G2PC
-permut_ag_G2PC = G2PC(ag,X_z,Y_pred_ag,100, np.squeeze(groups-1),0)
+permut_ag_G2PC = G2PC(ag,X_z,Y_pred_ag,100, np.squeeze(groups-1),1,0)
 
-# Calculate Accuracy
 ACC_ag = np.sum(np.array(np.squeeze(Y_real))==np.array(Y_pred_ag))/len(Y_pred_ag)
 
-# Plot G2PC Results
 fig = plt.figure(figsize=(10,10))
 ax = plt.boxplot((permut_ag_G2PC))
 plt.xticks(np.arange(1,len(GroupNames)+1),GroupNames,rotation=90,fontsize=14)#
@@ -412,6 +493,7 @@ for i in range(np.shape(permut_ag_L2PC)[0]):
     elif Y_pred_ag[i] == 4:
         c = 'yellow'
     plt.plot(np.mean(permut_ag_L2PC[i,:,:],axis=0),marker='o',color=c,alpha=0.3)
+# plt.plot(np.median(permut_dbscan_L2PC,axis=(0,1)),marker='o',color='black',linewidth=2,markersize=12)
 plt.plot(np.mean(np.mean(permut_ag_L2PC,axis=(1)),axis=0),marker='o',color='black',linewidth=2,markersize=12)
 x_tick_pts = np.arange(1,29)
 plt.xticks(x_tick_pts, GroupNames,rotation=90,fontsize=14)
@@ -421,8 +503,8 @@ ylabel = plt.ylabel('Perturbation Percent Change',fontsize=16)
 #%% C-Means Clustering
 
 # Determine Optimal Number of Clusters
-n_clusters = np.arange(2,16)  # Number of Clusters to Try
-silhouette_vals = np.zeros((len(n_clusters),1)) # Preallocate Array for Silhouette Values
+n_clusters = np.arange(2,16)  
+silhouette_vals = np.zeros((len(n_clusters),1))
 
 m = 2 # model parameter
 error = 0.005 # model parameter
@@ -438,28 +520,24 @@ for i in n_clusters:
     
     count += 1
     
-# Plot Silhouette Values
 fig = plt.figure(figsize=(5,5))
 plt.plot(n_clusters,silhouette_vals)
 
-max_idx = np.argmax(silhouette_vals) # Find Index of Max Silhouette Value
-opt_cluster = n_clusters[max_idx] # Find Optimal Number of Clusters with Index
+max_idx = np.argmax(silhouette_vals)
+opt_cluster = n_clusters[max_idx]
 
-# Redo Clustering
 cntr,u = cmeans(np.transpose(X_z),opt_cluster,m, error=error, maxiter=maxiter,seed=0)[:2]
 
 Y_pred_cmeans = np.argmax(u,axis=0)
 
-# Place Cluster Parameters into Dictionary to be Passed to G2PC and L2PC Functions
 cmeans_mdl = {"cntr":cntr,"nclusters":opt_cluster,"m":m,"error":error,"maxiter": maxiter, "Y_pred":Y_pred_cmeans}
 
-# G2PC
-permut_cmeans_G2PC = G2PC(cmeans_mdl,X_z,Y_pred_cmeans,100, np.squeeze(groups-1),0)
+permut_cmeans_G2PC = G2PC(cmeans_mdl,X_z,Y_pred_cmeans,100, np.squeeze(groups-1),0,0)
 
-# Clustering Accuracy
+# permut_cmeans_G2PC,R,VarData = G2PC(cmeans_mdl,X_z,Y_pred_kmeans,100, np.squeeze(groups-1),1,1)
+
 ACC_cmeans = np.sum(np.array(np.squeeze(Y_real))==np.array(Y_pred_cmeans))/len(Y_pred_cmeans)
 
-# Plot G2PC Results
 fig = plt.figure(figsize=(10,10))
 ax = plt.boxplot((permut_cmeans_G2PC))
 plt.xticks(np.arange(1,len(GroupNames)+1),GroupNames,rotation=90,fontsize=14)#
@@ -469,7 +547,6 @@ title = plt.title('G2PC - Fuzzy C-means Results',fontsize=20)
 # L2PC
 permut_cmeans_L2PC = L2PC(cmeans_mdl,  X_z, Y_pred_cmeans, 30, 100,np.squeeze(groups-1), 0)
 
-# Plot L2PC Results
 fig = plt.figure(figsize=(10,10))
 for i in range(np.shape(permut_cmeans_G2PC)[0]):
     if Y_pred_cmeans[i] == 0:
@@ -483,16 +560,25 @@ for i in range(np.shape(permut_cmeans_G2PC)[0]):
     elif Y_pred_cmeans[i] == 4:
         c = 'yellow'
     plt.plot(np.mean(permut_cmeans_L2PC[i,:,:],axis=0),marker='o',color=c,alpha=0.3)
+# plt.plot(np.median(permut_dbscan_L2PC,axis=(0,1)),marker='o',color='black',linewidth=2,markersize=12)
 plt.plot(np.mean(np.mean(permut_cmeans_L2PC,axis=(1)),axis=0),marker='o',color='black',linewidth=2,markersize=12)
 x_tick_pts = np.arange(0,28)
 plt.xticks(x_tick_pts, GroupNames,rotation=90,fontsize=14)
 plt.title('L2PC - Fuzzy C-means Results',fontsize=20)
 ylabel = plt.ylabel('Perturbation Percent Change',fontsize=16)
 
+Mean_Effect_Cmeans,AUC_Cmeans = LR_ENR(X_z,Y_pred_cmeans,groups,GroupNames)
+
 #%% Save Results
 
-output_loc = "C:/Users/antho/OneDrive/Documents/Calhoun_Lab/Projects/Clustering_Explainability/DataAndResults/G2PC_L2PC_Results_nz_sFC_all.mat"
+output_loc = "C:/Users/antho/OneDrive/Documents/Calhoun_Lab/Projects/Clustering_Explainability/JMLR/KDD2021/DataAndResults/G2PC_L2PC_Results_nz_sFC_all_V2.mat"
 output = {"permut_cmeans_G2PC":permut_cmeans_G2PC,"permut_cmeans_L2PC":permut_cmeans_L2PC,"permut_kmeans_G2PC":permut_kmeans_G2PC,"permut_kmeans_L2PC":permut_kmeans_L2PC,"Y_pred_cmeans":Y_pred_cmeans,"Y_pred_kmeans":Y_pred_kmeans,"Y_real":Y_real}
 # output = {"permut_kmeans_L2PC":permut_kmeans_L2PC}
 
 savemat(output_loc,output,appendmat=True)
+
+output_loc = "C:/Users/antho/OneDrive/Documents/Calhoun_Lab/Projects/Clustering_Explainability/JMLR/LR_Results_nz_sFC_all_V2.mat"
+output = {"Mean_Effect_Cmeans":Mean_Effect_Cmeans,"Mean_Effect_Kmeans":Mean_Effect_Kmeans,"AUC_Cmeans":AUC_Cmeans,"AUC_Kmeans":AUC_Kmeans}
+
+savemat(output_loc,output,appendmat=True)
+    
